@@ -156,11 +156,13 @@ class TestInstallArgConstruction:
         monkeypatch.setattr(ld.shutil, "which", lambda _: None)
 
         captured = {}
+        calls: list[list[str]] = []
 
         def fake_run(cmd, *a, **k):
             # The pip --version probe must look healthy so we reach install.
             if "--version" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+            calls.append(list(cmd))
             captured["cmd"] = cmd
             return subprocess.CompletedProcess(cmd, 0, "ok", "")
 
@@ -170,7 +172,11 @@ class TestInstallArgConstruction:
 
         result = ld._venv_pip_install(("somepkg==1.2.3",))
         assert result.success
-        cmd = captured["cmd"]
+        # The backend install, not the --no-deps security-override repair pass
+        # that follows it (see tools/lazy_deps._pip_reassert_overrides).
+        backend = [c for c in calls if "--no-deps" not in c]
+        assert backend, f"no backend install captured: {calls}"
+        cmd = backend[0]
         # --target points at the durable dir...
         assert "--target" in cmd
         assert str(target) in cmd
@@ -178,6 +184,37 @@ class TestInstallArgConstruction:
         assert "--constraint" in cmd
         # ...and the spec is last.
         assert cmd[-1] == "somepkg==1.2.3"
+
+    def test_override_repair_pass_targets_the_durable_dir(self, tmp_path, monkeypatch):
+        """The pip override repair must land in the durable target too.
+
+        Without --target the repair would write the overridden package into
+        the sealed core venv, which is exactly what durable-target mode exists
+        to prevent.
+        """
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        monkeypatch.setattr(ld.shutil, "which", lambda _: None)
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, *a, **k):
+            if "--version" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+        monkeypatch.setattr(ld, "_activate_target_on_syspath", lambda _t: None)
+
+        ld._venv_pip_install(("somepkg==1.2.3",))
+        repair = [c for c in calls if "--no-deps" in c]
+        if not ld._SECURITY_OVERRIDES:
+            pytest.skip("no security overrides configured")
+        assert repair, f"no override repair pass captured: {calls}"
+        assert "--target" in repair[0] and str(target) in repair[0], (
+            f"repair pass must write to the durable target: {repair[0]}"
+        )
 
     def test_no_target_args_in_venv_scoped_mode(self, monkeypatch):
         # Env unset → plain venv-scoped install, no --target and no

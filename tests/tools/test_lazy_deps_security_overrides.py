@@ -142,8 +142,11 @@ class TestOverridesReachBothInstallerTiers:
                         contents[flag] = p.read_text(encoding="utf-8")
 
             class R:
-                returncode = 1  # force fallthrough to the next tier
-                stdout = ""
+                # uv tier fails so the ladder falls through to pip; the pip
+                # probe and the pip install itself succeed, so the --no-deps
+                # repair pass runs.
+                returncode = 1 if (cmd and "uv" in cmd[0]) else 0
+                stdout = "pip 24.0"
                 stderr = "stubbed"
 
             return R()
@@ -168,20 +171,38 @@ class TestOverridesReachBothInstallerTiers:
                 f"override {spec!r} missing from the file handed to uv: {body!r}"
             )
 
-    def test_pip_tier_receives_the_floor_as_a_constraint(self, captured):
-        """pip has no --overrides; it must still get the floor via --constraint."""
-        calls, contents = captured
-        pip_installs = [
-            c for c in calls if "-m" in c and "pip" in c and "install" in c
+    def test_pip_tier_reasserts_the_floor_with_no_deps(self, captured):
+        """pip has no --overrides; it must re-assert the floor via --no-deps.
+
+        Passing the floor as a --constraint instead would hold the pinned
+        package but resolve the *backend* backwards, so the repair pass is the
+        behaviour under test.
+        """
+        calls, _ = captured
+        repair = [
+            c for c in calls if "install" in c and "--no-deps" in c
         ]
-        assert pip_installs, f"no pip tier install captured: {calls}"
-        cmd = pip_installs[0]
-        assert "--constraint" in cmd, (
-            f"pip tier must receive the security floor as a constraint: {cmd}"
+        assert repair, (
+            f"pip tier must re-assert security overrides with --no-deps: {calls}"
         )
-        body = contents.get("--constraint", "")
+        cmd = repair[0]
         for spec in ld._SECURITY_OVERRIDES:
-            assert spec in body
+            assert spec in cmd, (
+                f"override {spec!r} missing from the pip repair pass: {cmd}"
+            )
+
+    def test_pip_repair_pass_does_not_reinstall_the_backend(self, captured):
+        """The repair pass must touch only the overridden packages.
+
+        Including the backend specs would re-run resolution and undo the point
+        of --no-deps.
+        """
+        calls, _ = captured
+        repair = [c for c in calls if "install" in c and "--no-deps" in c]
+        assert repair
+        assert "alibabacloud-dingtalk==2.2.42" not in repair[0], (
+            f"repair pass must not re-install the backend: {repair[0]}"
+        )
 
     def test_temp_files_are_cleaned_up(self, captured):
         calls, _ = captured
@@ -196,7 +217,11 @@ class TestOverridesReachBothInstallerTiers:
     def test_specs_still_reach_the_installer(self, captured):
         """The override plumbing must not displace the actual packages."""
         calls, _ = captured
-        installs = [c for c in calls if "install" in c]
+        # Exclude the --no-deps repair pass, which deliberately carries only
+        # the overridden packages (see test_pip_repair_pass_does_not_reinstall).
+        installs = [
+            c for c in calls if "install" in c and "--no-deps" not in c
+        ]
         assert installs, f"no install invocation captured: {calls}"
         for cmd in installs:
             assert "alibabacloud-dingtalk==2.2.42" in cmd, (

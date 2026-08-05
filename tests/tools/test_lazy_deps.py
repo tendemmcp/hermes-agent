@@ -18,6 +18,22 @@ import pytest
 import tools.lazy_deps as ld
 
 
+def _register_fake_feature(monkeypatch, feature: str, specs: tuple[str, ...]) -> str:
+    """Register a synthetic feature + backing extra for a test.
+
+    Specs live in pyproject.toml's ``[project.optional-dependencies]``, so a
+    test feature needs both halves: an entry in ``LAZY_FEATURES`` mapping it to
+    an extra name, and that extra in the (cached) pyproject table. Returns the
+    generated extra name.
+    """
+    extra = f"__test-{feature.replace('.', '-')}"
+    monkeypatch.setitem(ld.LAZY_FEATURES, feature, extra)
+    table = dict(ld._optional_dependencies())
+    table[extra] = tuple(specs)
+    monkeypatch.setattr(ld, "_optional_dependencies", lambda: table)
+    return extra
+
+
 # ---------------------------------------------------------------------------
 # Spec safety
 # ---------------------------------------------------------------------------
@@ -77,7 +93,7 @@ class TestSpecSafety:
 class TestAllowlist:
     def test_unknown_feature_raises(self, monkeypatch):
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
-        with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):
+        with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_FEATURES"):
             ld.ensure("not.a.real.feature")
 
 
@@ -93,7 +109,7 @@ class TestAllowlist:
 class TestSecurityGating:
     def test_disabled_via_config_raises(self, monkeypatch):
         # Pretend honcho is missing AND lazy installs are disabled.
-        monkeypatch.setitem(ld.LAZY_DEPS, "test.feat", ("packageX>=1.0,<2",))
+        _register_fake_feature(monkeypatch, "test.feat", ("packageX>=1.0,<2",))
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: False)
         with pytest.raises(ld.FeatureUnavailable, match="lazy installs disabled"):
@@ -119,7 +135,7 @@ class TestSecurityGating:
 class TestEnsure:
     def test_already_satisfied_is_noop(self, monkeypatch):
         # If the package is importable, ensure() returns without calling pip.
-        monkeypatch.setitem(ld.LAZY_DEPS, "test.satisfied", ("zzzfake>=1",))
+        _register_fake_feature(monkeypatch, "test.satisfied", ("zzzfake>=1",))
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: True)
         # If pip were called, this would fail loudly.
         monkeypatch.setattr(
@@ -132,7 +148,7 @@ class TestEnsure:
     def test_install_succeeds_but_still_missing_raises(self, monkeypatch):
         # Pip says success but the package still isn't importable
         # (e.g. site-packages caching, wrong python). Surface this.
-        monkeypatch.setitem(ld.LAZY_DEPS, "test.cache", ("zzzfake>=1",))
+        _register_fake_feature(monkeypatch, "test.cache", ("zzzfake>=1",))
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         monkeypatch.setattr(
@@ -154,7 +170,7 @@ class TestIsAvailable:
 
 
     def test_missing_returns_false(self, monkeypatch):
-        monkeypatch.setitem(ld.LAZY_DEPS, "test.miss", ("zzzfake>=1",))
+        _register_fake_feature(monkeypatch, "test.miss", ("zzzfake>=1",))
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: False)
         assert ld.is_available("test.miss") is False
 
@@ -164,7 +180,7 @@ class TestIsAvailable:
 #
 # The original implementation returned True the moment the package name
 # was importable, ignoring the spec's version range. That meant pin bumps
-# in LAZY_DEPS never propagated to users who already lazy-installed the
+# in the extras never propagated to users who already lazy-installed the
 # backend at an older version. _is_satisfied now parses the spec and
 # checks the installed version against the constraint.
 # ---------------------------------------------------------------------------
@@ -214,12 +230,12 @@ class TestIsSatisfiedVersionAware:
 
         huggingface-hub arrives in the venv via the core lock (transformers /
         sentence-transformers for local Hindsight, faster-whisper, tokenizers).
-        With the LAZY_DEPS pin held in lockstep with uv.lock, the version the
+        With the extra's pin held in lockstep with uv.lock, the version the
         core installs satisfies the trace-upload spec, so the `hermes update`
         lazy-refresh pass reports "current" instead of reinstalling — the
         downgrade that used to break the Hindsight daemon can't happen.
         """
-        spec = ld.LAZY_DEPS["tool.trace_upload"][0]
+        spec = ld.feature_specs("tool.trace_upload")[0]
         pinned = ld._specifier_from_spec(spec).lstrip("=")
         self._fake_version(monkeypatch, {"huggingface-hub": pinned})
         assert ld._is_satisfied(spec) is True
@@ -263,6 +279,9 @@ class TestIsSatisfiedVersionAware:
     ):
         self._fake_version(monkeypatch, installed_versions)
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        # Force the pip ladder: uv sync would shell out for real, and this
+        # test is about WHICH stale specs get repaired, not the installer.
+        monkeypatch.setattr(ld, "_uv_sync_extra", lambda _f: None)
         installed = []
 
         def fake_install(specs, **kwargs):
@@ -276,7 +295,9 @@ class TestIsSatisfiedVersionAware:
 
         ld.ensure(feature, prompt=False)
 
-        assert tuple(installed) == expected_repairs
+        # Order follows the extra's declaration order, which composition can
+        # legitimately reshuffle — assert the SET of stale pins repaired.
+        assert set(installed) == set(expected_repairs)
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +348,8 @@ class TestRefreshActiveFeatures:
 
     def test_mixed_results_returns_per_feature_status(self, monkeypatch):
         monkeypatch.setattr(ld, "active_features", lambda: ["a.ok", "b.fail"])
-        monkeypatch.setitem(ld.LAZY_DEPS, "a.ok", ("pkga==1.0",))
-        monkeypatch.setitem(ld.LAZY_DEPS, "b.fail", ("pkgb==1.0",))
+        _register_fake_feature(monkeypatch, "a.ok", ("pkga==1.0",))
+        _register_fake_feature(monkeypatch, "b.fail", ("pkgb==1.0",))
         # a.ok: already satisfied → "current"
         # b.fail: missing + install fails → "failed:"
         def fake_satisfied(spec):

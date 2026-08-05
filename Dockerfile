@@ -235,9 +235,10 @@ RUN cd plugins/platforms/photon/sidecar && \
 # (handpicked set intended for the production image — excludes `[dev]`),
 # plus gateway messaging adapters that should work in the published image
 # without a first-boot lazy install.  We do NOT use `--all-extras`:
-# that would pull in `[rl]` (atroposlib + tinker + torch + wandb from
-# git), `[yc-bench]` (another git dep), and `[termux-all]` (Android
-# redundancy), none of which belong in the published container.
+# that would pull `[dev]` (pytest/ruff/ty/debugpy — test tooling has no
+# place in a production image), `[termux-all]` (Android redundancy), and
+# the heavy optional stacks `[voice]`/`[wake]` (faster-whisper, onnxruntime,
+# sounddevice, numpy) that most deployments never touch.
 #
 # Provider packages (anthropic, bedrock, azure-identity) are included
 # so Docker users can use these providers without requiring runtime

@@ -45,7 +45,7 @@ Security model:
 * **PyPI by package name only.** Specs may be ``"package>=1.0,<2"`` etc.
   We do NOT support ``--index-url`` overrides, ``git+https://``, file:
   paths, or any other input that could be hijacked by a malicious config.
-* **Allowlist.** Only specs that appear in :data:`LAZY_DEPS` can be
+* **Allowlist.** Only specs that appear in :data:`LAZY_FEATURES` can be
   installed via this path. A typo in feature name doesn't get the user
   install-anything semantics.
 * **Opt-out.** Setting ``security.allow_lazy_installs: false`` in
@@ -59,7 +59,8 @@ Security model:
 
 Adding a new backend:
 
-1. Add an entry to :data:`LAZY_DEPS` with the package specs.
+1. Add the packages as an extra in pyproject.toml, then map the feature
+   to that extra in :data:`LAZY_FEATURES`.
 2. At the top of the backend module's import path, call
    ``ensure("feature.name")`` inside a try/except that converts
    :class:`FeatureUnavailable` to a useful runtime error.
@@ -67,6 +68,7 @@ Adding a new backend:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -85,233 +87,192 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Allowlist of lazy-installable backends.
+# Feature -> pyproject extra mapping.
 #
-# Keys are dot-separated feature names ("namespace.backend"). Values are
-# tuples of pip-installable specs that match the corresponding extra in
-# pyproject.toml. The framework enforces that only specs from this map
-# can flow into the pip install command.
+# Keys are dot-separated feature names ("namespace.backend"). Values are the
+# name of the ``[project.optional-dependencies]`` extra in pyproject.toml that
+# carries that backend's packages.
+#
+# The specs themselves live in pyproject.toml and NOWHERE else. This module
+# used to keep its own copy of every pin, which meant two sources of truth for
+# the same dependency set and a family of drift-detector tests to keep them
+# honest. Worse, that copy could not see ``[tool.uv] override-dependencies``,
+# so a backend whose metadata capped a security-pinned package silently
+# downgraded it on first use (cryptography 50.0.0 -> 48.0.1 via DingTalk).
+# Reading the extra means a lazy install resolves exactly what `uv lock`
+# audited.
 # =============================================================================
 
 
-LAZY_DEPS: dict[str, tuple[str, ...]] = {
+LAZY_FEATURES: dict[str, str] = {
     # ─── Inference providers ───────────────────────────────────────────────
-    # Native Anthropic SDK — needed when provider=anthropic (not via
-    # OpenRouter / aggregators which use the openai SDK).
-    "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
-    # AWS Bedrock provider
-    "provider.bedrock": ("boto3==1.42.89",),
-    # Google Vertex AI provider — OAuth2 token minting for the Gemini
-    # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
-    # google-auth is NOT in [all] so plain installs don't carry it.
-    "provider.vertex": (
-        "google-auth==2.55.1",
-        "pyasn1==0.6.4",
-    ),
-    # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
-    # service principal, az login, VS Code, azd, PowerShell). Only loaded
-    # when model.auth_mode=entra_id is selected; key-based azure-foundry
-    # users never pay this import.
-    "provider.azure_identity": ("azure-identity==1.25.3",),
+    "provider.anthropic": "anthropic",
+    "provider.bedrock": "bedrock",
+    "provider.vertex": "vertex",
+    "provider.azure_identity": "azure-identity",
 
     # ─── Web search backends ───────────────────────────────────────────────
-    "search.exa": ("exa-py==2.10.2",),
-    "search.firecrawl": ("firecrawl-py==4.17.0",),
-    "search.parallel": ("parallel-web==0.4.2",),
+    "search.exa": "exa",
+    "search.firecrawl": "firecrawl",
+    "search.parallel": "parallel-web",
 
-    # ─── Monitoring ─────────────────────────────────────────────────────────
-    # OTLP gateway monitoring export. Lazily installed on first use of
-    # monitoring.gateway_health_export / monitoring.export.otlp. Tracks the
-    # `otlp` extra in pyproject.toml — bump both together.
-    "export.otlp": (
-        "opentelemetry-sdk==1.39.1",
-        "opentelemetry-exporter-otlp-proto-http==1.39.1",
-    ),
+    # ─── Monitoring ────────────────────────────────────────────────────────
+    "export.otlp": "otlp",
 
-    # ─── TTS providers ─────────────────────────────────────────────────────
-    # Pinned to exact versions to match pyproject.toml's no-ranges policy
-    # (see comment at top of [project.dependencies]). When bumping, update
-    # both this map AND the corresponding extra in pyproject.toml.
-    #
-    # mistralai pin tracks the `mistral` extra in pyproject.toml. PyPI
-    # quarantined the project 2026-05-12 (malicious 2.4.6, Mini Shai-Hulud);
-    # 2.4.6 was removed and clean releases resumed (2.4.7, 2.4.8). Voxtral
-    # STT + TTS share the same SDK.
-    "tts.mistral": ("mistralai==2.4.8",),
-    "tts.edge": ("edge-tts==7.2.7",),
-    "tts.elevenlabs": ("elevenlabs==1.59.0",),
+    # ─── Speech to text ────────────────────────────────────────────────────
+    "stt.faster_whisper": "voice",
+    "stt.mistral": "mistral",
+    "stt.silk": "silk",
 
-    # ─── Speech-to-text providers ──────────────────────────────────────────
-    "stt.mistral": ("mistralai==2.4.8",),
-    "stt.faster_whisper": (
-        "faster-whisper==1.2.1",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    # SILK voice-note decoding (WeChat/QQ .silk voice messages). pilk is a
-    # small silk-v3 codec binding; installed on first .silk transcription.
-    "stt.silk": ("pilk==0.2.4",),
+    # ─── Text to speech ────────────────────────────────────────────────────
+    "tts.edge": "edge-tts",
+    "tts.elevenlabs": "tts-premium",
+    "tts.mistral": "mistral",
 
-    # ─── Wake word ("Hey Hermes") engines ──────────────────────────────────
-    # Keep in sync with the `wake` extra in pyproject.toml. openWakeWord is the
-    # free, local default (ONNX runtime); Porcupine is the premium engine.
-    # openWakeWord's ONNX embedding model returns near-zero scores on macOS
-    # ARM64 (dscripka/openWakeWord#336), so the wake word runs on the tflite
-    # backend there. Upstream declares tflite-runtime for Linux only;
-    # ai-edge-litert is the macOS equivalent, bridged in tools/wake_word.py.
-    # It lives in its own feature because lazy-dep specs cannot carry PEP 508
-    # environment markers (_spec_is_safe rejects ";"), so the platform gate is
-    # applied by the caller instead.
-    "wake.openwakeword.tflite": (
-        "ai-edge-litert==2.1.6",
-    ),
-    "wake.openwakeword": (
-        "openwakeword==0.6.0",
-        "onnxruntime==1.27.0",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    # Open-vocabulary keyword spotting: any typed phrase, zero training.
-    # sentencepiece is required by sherpa_onnx.text2token (runtime phrase
-    # tokenization) even though sherpa-onnx doesn't declare it.
-    "wake.sherpa": (
-        "sherpa-onnx==1.13.4",
-        "sentencepiece==0.2.2",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    "wake.porcupine": (
-        "pvporcupine==4.0.3",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
+    # ─── Wake word engines ─────────────────────────────────────────────────
+    "wake.openwakeword": "wake-openwakeword",
+    "wake.openwakeword.tflite": "wake-tflite",
+    "wake.sherpa": "wake-sherpa",
+    "wake.porcupine": "wake-porcupine",
 
     # ─── Image generation backends ─────────────────────────────────────────
-    "image.fal": ("fal-client==0.13.1",),
+    "image.fal": "fal",
 
     # ─── Memory providers ──────────────────────────────────────────────────
-    "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
-    # supermemory + mem0 are opt-in cloud memory providers with their own
-    # SDKs. On the published Docker image the agent venv is sealed
-    # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
-    # durable target — so, like honcho/hindsight, these MUST go through
-    # ensure() to be installable there. Without an allowlist entry + an
-    # ensure() call at the import site, the SDK never installs on a hosted
-    # instance and the provider silently reports itself unavailable.
-    "memory.supermemory": ("supermemory==3.50.0",),
-    "memory.mem0": ("mem0ai==2.0.10",),
+    "memory.honcho": "honcho",
+    "memory.hindsight": "hindsight",
+    "memory.supermemory": "supermemory",
+    "memory.mem0": "mem0",
 
-    # ─── Messaging platforms (lazy-installable on demand) ──────────────────
-    "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
-    # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for
-    # Discord CDN's Brotli-encoded attachments. Without it, aiohttp falls
-    # back to google's `Brotli` package (1-arg API), and any .txt/.md/.doc
-    # uploaded to the Discord gateway fails to decode at att.read() with
-    # "Can not decode content-encoding: br" — see #12511 / #15744.
-    "platform.discord": (
-        "discord.py[voice]==2.7.1",
-        "brotlicffi==1.2.0.1",
-        # discord.py pulls aiohttp transitively (>=3.7.4,<4) as its HTTP
-        # backbone. Pin the patched floor here too so the lazy Discord path
-        # can't keep an already-installed vulnerable aiohttp satisfying that
-        # range — mirrors the messaging extra and platform.slack.
-        "aiohttp==3.14.3", # aiohttp pinned to upgrade past CVEs
-    ),
-    "platform.slack": (
-        "slack-bolt==1.29.0",
-        "slack-sdk==3.43.0",
-        "aiohttp==3.14.3", # aiohttp pinned to upgrade past CVEs
-    ),
-    "platform.matrix": (
-        "mautrix[encryption]==0.21.0",
-        "aiosqlite==0.22.1",
-        "asyncpg==0.31.0",
-        "aiohttp-socks==0.11.0",
-        # mautrix (aiohttp>=3,<4) and aiohttp-socks (aiohttp>=3.10.0) only cap
-        # aiohttp transitively, so a vulnerable already-installed aiohttp still
-        # satisfies both — pin the patched floor here too, like platform.discord.
-        "aiohttp==3.14.3",  # aiohttp pinned to upgrade past CVEs
-    ),
-    "platform.dingtalk": (
-        "dingtalk-stream==0.24.3",
-        "alibabacloud-dingtalk==2.2.42",
-        "qrcode==7.4.2",
-    ),
-    "platform.feishu": (
-        "lark-oapi==1.6.8",
-        "qrcode==7.4.2",
-    ),
-    # WeCom callback-mode adapter — parses untrusted XML POST bodies. Pulls
-    # defusedxml only; aiohttp/httpx are core dependencies of every messaging
-    # adapter and ship via `platform.discord` / `platform.slack` / etc.
-    "platform.wecom_callback": ("defusedxml==0.7.1",),
-    # Microsoft Teams adapter — microsoft-teams-apps pulls a heavy tree
-    # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
-    # installed on demand like every other messaging platform; also exposed
-    # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),  # aiohttp pinned to upgrade past CVEs
+    # ─── Messaging platforms ───────────────────────────────────────────────
+    "platform.telegram": "telegram",
+    "platform.discord": "discord",
+    "platform.slack": "slack",
+    "platform.matrix": "matrix",
+    "platform.dingtalk": "dingtalk",
+    "platform.feishu": "feishu",
+    "platform.wecom_callback": "wecom",
+    "platform.teams": "teams",
 
     # ─── Terminal backends ─────────────────────────────────────────────────
-    "terminal.modal": ("modal==1.3.4",),
-    "terminal.daytona": ("daytona==0.155.0",),
-    "terminal.vercel": ("vercel==0.7.2",),
+    "terminal.modal": "modal",
+    "terminal.daytona": "daytona",
+    "terminal.vercel": "vercel",
 
     # ─── Skills ────────────────────────────────────────────────────────────
-    "skill.google_workspace": (
-        "google-api-python-client==2.194.0",
-        "google-auth==2.55.1",
-        "google-auth-oauthlib==1.3.1",
-        "google-auth-httplib2==0.3.1",
-        # Transitive via google-api-python-client/google-auth-httplib2; keep explicit
-        # so lazy installs do not resolve vulnerable transitives: httplib2 0.31.2
-        # (GHSA-j5g9-f88f-gfj3 decompression bomb DoS), stale pyasn1/google-auth.
-        "httplib2==0.32.0",
-        "pyasn1==0.6.4",
-    ),
-    "skill.youtube": ("youtube-transcript-api==1.2.4",),
+    "skill.google_workspace": "google",
+    "skill.youtube": "youtube",
 
     # ─── Tools ─────────────────────────────────────────────────────────────
-    # ACP adapter (VS Code / Zed / JetBrains integration)
-    "tool.acp": ("agent-client-protocol==0.9.0",),
-    # Dashboard (`hermes dashboard`)
-    "tool.dashboard": (
-        "fastapi==0.133.1",
-        "uvicorn[standard]==0.41.0",
-        "starlette==1.3.1",  # CVE-2026-48710 (BadHost) — keep lazy-install in sync with pyproject [web]
-        "python-multipart==0.0.32",  # FastAPI UploadFile/Form for streaming uploads (NS-501)
-    ),
-    # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency
-    # (pyproject `dependencies`), so this entry is a belt-and-suspenders fallback
-    # for stripped/source-build installs that somehow dropped it. The vision
-    # call site uses prompt=False so it can never raise a blocking input()
-    # prompt mid-session (#40490).
-    "tool.vision": ("Pillow==12.3.0",),
-    # Computer Use (cua-driver) — the MCP client SDK used to spawn and talk
-    # to the cua-driver process over stdio. Matches the `mcp` / `computer-use`
-    # extras in pyproject.toml. The one-liner installer pulls this in via
-    # `[all]`; lazy-installing here covers lean / partial / broken-extra
-    # installs so computer_use never dead-ends on `No module named 'mcp'`.
-    "tool.computer_use": (
-        "mcp==1.28.1",
-        "starlette==1.3.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
-    ),
-    # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
-    #
-    # huggingface-hub is a SHARED dependency: transformers (pulled by
-    # sentence-transformers for local Hindsight embeddings) requires
-    # >=1.5.0,<2, and faster-whisper/tokenizers depend on it transitively.
-    # Because active_features() marks a feature active from mere package
-    # presence, the `hermes update` lazy-refresh pass re-asserts THIS pin on
-    # every install where hub is present — so an exact pin below 1.5.0
-    # force-downgrades the shared package and breaks Hindsight startup
-    # (#60783). Policy: keep the exact pin (no ranges — security posture),
-    # but it MUST stay inside transformers' accepted window and MUST match
-    # uv.lock so the whole tree converges on ONE hub version
-    # (tests/test_project_metadata.py enforces both). When bumping: update
-    # here AND `uv lock --upgrade-package huggingface-hub` in lockstep.
-    "tool.trace_upload": ("huggingface-hub==1.24.0",),
+    # NOTE: no "tool.acp" entry. [acp] ships eagerly in [all] and nothing ever
+    # called ensure("tool.acp"), so the mapping was dead — and it put [acp] in
+    # both [all] and the lazy map, which the lazy-install policy forbids
+    # (test_lazy_installable_extras_excluded_from_all). Removed rather than
+    # dropping [acp] from [all]: the ACP entry point is a console script, so
+    # its dep must be present before the agent loop can lazy-install anything.
+    "tool.dashboard": "web",
+    "tool.computer_use": "computer-use",
+    "tool.trace_upload": "trace-upload",
 }
+
+
+# =============================================================================
+# pyproject extra -> specs
+# =============================================================================
+
+
+def _project_root() -> Optional[Path]:
+    """Return the checkout root holding pyproject.toml, or None.
+
+    Supported installs are git checkouts (``install.sh`` clones the repo) and
+    the Docker image, which copies ``pyproject.toml`` + ``uv.lock`` to its
+    WORKDIR. Anything else (a stray site-packages copy) has no project root and
+    falls back to the vendored spec table.
+    """
+    root = Path(__file__).resolve().parent.parent
+    return root if (root / "pyproject.toml").is_file() else None
+
+
+@functools.lru_cache(maxsize=1)
+def _optional_dependencies() -> dict[str, tuple[str, ...]]:
+    """Parse ``[project.optional-dependencies]`` from pyproject.toml."""
+    root = _project_root()
+    if root is None:
+        return {}
+    try:
+        import tomllib
+    except ImportError:  # pragma: no cover - py<3.11, unsupported
+        return {}
+    try:
+        data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug("Could not read pyproject.toml: %s", e)
+        return {}
+    raw = data.get("project", {}).get("optional-dependencies", {}) or {}
+    return {k: tuple(v) for k, v in raw.items()}
+
+
+_SELF_REF = re.compile(r"^hermes[-_]agent\[([^\]]+)\]$", re.IGNORECASE)
+
+
+def _split_marker(spec: str) -> tuple[str, str]:
+    """Split ``"pkg[extra]; marker"`` into ``("pkg[extra]", "; marker")``."""
+    head, sep, tail = spec.partition(";")
+    return head.strip(), (f";{tail}" if sep else "")
+
+
+def extra_specs(extra: str, _seen: Optional[frozenset] = None) -> tuple[str, ...]:
+    """Return the concrete specs for ``extra``, resolving ``hermes-agent[...]``.
+
+    Extras compose: ``[messaging]`` is ``hermes-agent[telegram]`` +
+    ``hermes-agent[discord]`` + ``hermes-agent[slack]``. Self-references are
+    expanded recursively; a cycle (or a reference to an extra that doesn't
+    exist) resolves to nothing rather than recursing forever.
+
+    A marker on a self-reference is distributed over the expansion, so
+    ``hermes-agent[wake-tflite]; platform_system == 'Darwin'`` yields
+    ``ai-edge-litert==2.1.6; platform_system == 'Darwin'`` — the same set pip
+    and uv would install.
+    """
+    seen = _seen or frozenset()
+    if extra in seen:
+        logger.debug("Cyclic extra reference at %r — stopping", extra)
+        return ()
+    table = _optional_dependencies()
+    if extra not in table:
+        return ()
+    seen = seen | {extra}
+    out: list[str] = []
+
+    def _add(spec: str) -> None:
+        if spec not in out:
+            out.append(spec)
+
+    for spec in table[extra]:
+        head, marker = _split_marker(spec)
+        m = _SELF_REF.match(head)
+        if m:
+            for sub in m.group(1).split(","):
+                for nested in extra_specs(sub.strip(), seen):
+                    if not marker:
+                        _add(nested)
+                        continue
+                    n_head, n_marker = _split_marker(nested)
+                    # Both sides carry a marker: they must BOTH hold.
+                    _add(
+                        f"{n_head}{n_marker} and{marker[1:]}"
+                        if n_marker else f"{n_head}{marker}"
+                    )
+        else:
+            _add(spec)
+    return tuple(out)
+
+
+def feature_extra(feature: str) -> str:
+    """Return the pyproject extra backing ``feature``, or raise KeyError."""
+    if feature not in LAZY_FEATURES:
+        raise KeyError(f"Unknown lazy feature: {feature!r}")
+    return LAZY_FEATURES[feature]
 
 
 # Conservative regex for spec validation — package name plus optional
@@ -583,7 +544,7 @@ def _is_satisfied(spec: str) -> bool:
     Checks both presence AND version. If the package is installed at a
     version outside the spec's range, returns False so the caller will
     upgrade/downgrade to the pinned version. This is what makes
-    ``hermes update`` propagate pin bumps in :data:`LAZY_DEPS` to already-
+    ``hermes update`` propagate pin bumps in :data:`LAZY_FEATURES` to already-
     installed backends instead of silently leaving stale versions in place.
 
     If ``packaging`` is unavailable for any reason (it's a transitive of
@@ -737,6 +698,134 @@ def _security_overrides_file() -> Optional[Path]:
         return None
 
 
+def _pip_reassert_overrides(
+    pip_cmd: list[str],
+    target_args: list[str],
+    *,
+    timeout: int,
+):
+    """Re-install ``_SECURITY_OVERRIDES`` with ``--no-deps`` after a pip install.
+
+    pip has no ``--overrides``. Passing the floor as a ``--constraint`` does
+    hold the pinned package, but pip satisfies the constraint by resolving the
+    *backend* backwards instead (alibabacloud-tea-openapi 0.4.5 -> 0.3.16, a
+    two-year-old sdist). A ``--no-deps`` second pass avoids that entirely: it
+    rewrites only the overridden distribution and leaves everything pip already
+    resolved in place.
+
+    Returns the failing ``CompletedProcess`` if the repair pass errored, or
+    None when there was nothing to do / it succeeded (caller keeps its own
+    result). A repair failure is surfaced because silently leaving a
+    downgraded security package installed is the bug this exists to prevent.
+    """
+    if not _SECURITY_OVERRIDES:
+        return None
+    try:
+        r = subprocess.run(
+            pip_cmd + ["install", "--no-deps", *target_args, *_SECURITY_OVERRIDES],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("pip override re-assert failed to run: %s", e)
+        return None
+    if r.returncode != 0:
+        logger.warning(
+            "pip override re-assert failed (rc=%d); a security-pinned package "
+            "may have been downgraded by this install: %s",
+            r.returncode, (r.stderr or "").strip()[:400],
+        )
+        return r
+    return None
+
+
+def _uv_sync_extra(feature: str) -> Optional[_InstallResult]:
+    """Install ``feature``'s extra with ``uv sync``, or None if not applicable.
+
+    ``uv sync`` is the preferred installer because it is the only one that
+    resolves against ``uv.lock`` and applies ``[tool.uv]
+    override-dependencies`` — i.e. it installs exactly the versions CI audited,
+    including security overrides that ``uv pip`` / ``pip`` cannot see.
+
+    Returns None (caller falls back to the pip ladder) when:
+
+    * durable-target mode is active — that mode deliberately installs to a
+      separate dir so it cannot mutate the sealed venv, and ``uv sync``
+      manages a venv wholesale with no ``--target`` equivalent;
+    * there is no project root with a ``uv.lock`` beside ``pyproject.toml``;
+    * uv isn't available;
+    * the feature's extra isn't declared in pyproject.
+
+    ``--inexact`` is required: a bare ``uv sync`` prunes everything not in the
+    synced extra set, which would uninstall every other lazy backend the user
+    has enabled. ``--no-install-project`` keeps it from reinstalling Hermes
+    itself over an editable checkout.
+    """
+    if _lazy_install_target() is not None:
+        return None
+    root = _project_root()
+    if root is None or not (root / "uv.lock").is_file():
+        return None
+    try:
+        extra = feature_extra(feature)
+    except KeyError:
+        return None
+    if extra not in _optional_dependencies():
+        return None
+
+    try:
+        from hermes_cli.managed_uv import resolve_uv
+
+        uv_bin = resolve_uv() or shutil.which("uv")
+    except Exception:
+        uv_bin = shutil.which("uv")
+    if not uv_bin:
+        return None
+
+    try:
+        from tools.environments.local import hermes_subprocess_env
+
+        env = hermes_subprocess_env(inherit_credentials=False)
+    except Exception:
+        env = dict(os.environ)
+    # uv sync targets the project environment; point it at the running venv so
+    # a lazy install lands where the agent will import from.
+    env["UV_PROJECT_ENVIRONMENT"] = str(Path(sys.executable).parent.parent)
+    # --locked needs [tool.uv] visible; UV_NO_CONFIG would drop exclude-newer.
+    env.pop("UV_NO_CONFIG", None)
+
+    cmd = [
+        uv_bin, "sync",
+        "--extra", extra,
+        "--inexact",
+        "--locked",
+        "--no-install-project",
+        "--python", sys.executable,
+    ]
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=600, env=env,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logger.debug("uv sync unavailable (%s) — falling back to pip ladder", e)
+        return None
+    if r.returncode == 0:
+        logger.info("Installed extra [%s] for feature %r via uv sync", extra, feature)
+        return _InstallResult(True, r.stdout or "", r.stderr or "")
+    # A stale lockfile (--locked refuses) or any other sync failure falls back
+    # rather than hard-failing: the pip ladder can still install the specs.
+    logger.debug(
+        "uv sync --extra %s failed (rc=%d), falling back: %s",
+        extra, r.returncode, (r.stderr or "").strip()[:300],
+    )
+    return None
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -776,17 +865,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         constraint_args = ["--constraint", str(constraints)]
     # uv-only: pip has no --overrides. See _SECURITY_OVERRIDES.
     override_args: list[str] = []
-    # pip tier: --overrides doesn't exist, but --constraint enforces the same
-    # floor. Measured difference on the DingTalk case: with the constraint pip
-    # holds cryptography at 50.0.0 and resolves alibabacloud-tea-openapi back
-    # to 0.3.16; without it, cryptography is downgraded to 48.0.1 instead. An
-    # older backend is a functional regression, a downgraded cryptography is a
-    # security one — so the fallback tier takes the constraint. (uv's
-    # --overrides avoids the tradeoff entirely and is tried first.)
-    pip_override_args: list[str] = []
     if overrides is not None:
         override_args = ["--overrides", str(overrides)]
-        pip_override_args = ["--constraint", str(overrides)]
 
     try:
         venv_root = Path(sys.executable).parent.parent
@@ -848,11 +928,24 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
         try:
             r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *pip_override_args, *specs],
+                pip_cmd + ["install", *target_args, *constraint_args, *specs],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
             )
+            if r.returncode == 0:
+                # pip has no --overrides, so a backend whose metadata caps a
+                # security-pinned package below its floor has just downgraded
+                # it. Re-assert the floor with --no-deps, which rewrites only
+                # the overridden package and leaves the backend at the version
+                # pip resolved. Measured on the DingTalk case: this yields
+                # cryptography 50.0.0 AND alibabacloud-tea-openapi 0.4.5 —
+                # identical to uv's --overrides. (`pip check` will report the
+                # violated cap afterwards; that is what an override IS, and uv
+                # produces the same end state without the diagnostic.)
+                repair = _pip_reassert_overrides(pip_cmd, target_args, timeout=timeout)
+                if repair is not None:
+                    r = repair
             if r.returncode == 0 and target is not None:
                 _activate_target_on_syspath(target)
             return _InstallResult(r.returncode == 0, r.stdout or "", r.stderr or "")
@@ -875,10 +968,24 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
 
 def feature_specs(feature: str) -> tuple[str, ...]:
-    """Return the registered specs for a feature, or raise KeyError."""
-    if feature not in LAZY_DEPS:
-        raise KeyError(f"Unknown lazy feature: {feature!r}")
-    return LAZY_DEPS[feature]
+    """Return the specs for ``feature``, read from its pyproject extra.
+
+    Raises KeyError for an unknown feature, and FeatureUnavailable if the
+    feature maps to an extra that pyproject doesn't define (a mapping typo, or
+    a stripped install with no pyproject) — failing loudly beats installing
+    nothing and reporting success.
+    """
+    extra = feature_extra(feature)
+    specs = extra_specs(extra)
+    if not specs:
+        raise FeatureUnavailable(
+            feature,
+            (),
+            f"feature {feature!r} maps to extra [{extra}], which resolved to no "
+            f"packages. Either pyproject.toml is unreadable from "
+            f"{_project_root()!r}, or [{extra}] does not exist.",
+        )
+    return specs
 
 
 def feature_missing(feature: str) -> tuple[str, ...]:
@@ -898,9 +1005,9 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     batch) get prompt=False and skip the confirmation — config flag is
     the gate in that case.
     """
-    if feature not in LAZY_DEPS:
+    if feature not in LAZY_FEATURES:
         raise FeatureUnavailable(
-            feature, (), f"feature {feature!r} not in LAZY_DEPS allowlist"
+            feature, (), f"feature {feature!r} not in LAZY_FEATURES allowlist"
         )
 
     missing = feature_missing(feature)
@@ -941,7 +1048,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             )
 
     # Validate every spec against the allowlist + safety regex. Belt and
-    # braces — the keys-in-LAZY_DEPS check above already constrains this.
+    # braces — the keys-in-LAZY_FEATURES check above already constrains this.
     for spec in missing:
         if not _spec_is_safe(spec):
             raise FeatureUnavailable(
@@ -986,7 +1093,15 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             )
 
     logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
-    result = _venv_pip_install(missing)
+    # Tier 0: `uv sync --extra <name>`, which resolves against uv.lock and
+    # honours [tool.uv] override-dependencies. This is the only installer that
+    # reproduces exactly what CI audited, so it is tried before the
+    # pip-compatible ladder. Needs a project root + lockfile, and cannot serve
+    # durable-target mode (it manages a venv wholesale, and the sealed-venv
+    # image redirects installs to a separate dir on purpose).
+    result = _uv_sync_extra(feature)
+    if result is None:
+        result = _venv_pip_install(missing)
     if not result.success:
         # Surface the actual pip error so the user can debug PyPI-side
         # issues (404 quarantine, network down, etc.).
@@ -1021,16 +1136,16 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
 
 def is_available(feature: str) -> bool:
     """Return True if the feature's deps are already satisfied."""
-    if feature not in LAZY_DEPS:
+    if feature not in LAZY_FEATURES:
         return False
     return not feature_missing(feature)
 
 
 def feature_install_command(feature: str) -> Optional[str]:
     """Return the ``pip install`` command a user could run manually, or None."""
-    if feature not in LAZY_DEPS:
+    if feature not in LAZY_FEATURES:
         return None
-    specs = LAZY_DEPS[feature]
+    specs = feature_specs(feature)
     return "uv pip install " + " ".join(repr(s) for s in specs)
 
 
@@ -1057,7 +1172,7 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
 
     This is the environment-aware install path for callers whose package
     lists come from data (e.g. memory-provider plugin manifests declaring
-    ``pip_dependencies``) rather than the static :data:`LAZY_DEPS` allowlist.
+    ``pip_dependencies``) rather than the static :data:`LAZY_FEATURES` allowlist.
     It applies the exact same environment routing as :func:`ensure`:
 
     * **Venv-scoped by default** — installs into ``sys.executable``'s venv.
@@ -1145,10 +1260,16 @@ def active_features() -> list[str]:
     Features the user has never enabled stay quiet.
 
     Used by ``hermes update`` to figure out which lazy backends need a
-    refresh pass when pins move in :data:`LAZY_DEPS`.
+    refresh pass when pins move in :data:`LAZY_FEATURES`.
     """
     active = []
-    for feature, specs in LAZY_DEPS.items():
+    for feature in LAZY_FEATURES:
+        try:
+            specs = feature_specs(feature)
+        except FeatureUnavailable:
+            # Extra missing from pyproject (stripped install) — the feature
+            # can't be refreshed, and it certainly isn't active.
+            continue
         if specs and _is_present(specs[0]):
             active.append(feature)
     return active

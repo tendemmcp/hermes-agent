@@ -509,18 +509,24 @@ def _ensure_sdk_installed() -> bool:
     except ImportError:
         pass
 
+    # Resolve the pin from the [honcho] extra rather than hardcoding it here,
+    # so bumping the version (or a CVE floor) is a one-line pyproject edit
+    # instead of four string literals that can drift apart silently.
+    from tools.lazy_deps import extra_specs, install_specs
+
+    specs = list(extra_specs("honcho")) or ["honcho-ai"]
+    shown = " ".join(specs)
+
     print("  honcho-ai is not installed.")
-    answer = _prompt("Install it now? (honcho-ai==2.2.0)", default="y")
+    answer = _prompt(f"Install it now? ({shown})", default="y")
     if answer.lower() not in {"y", "yes"}:
-        print("  Skipping install. Run: pip install 'honcho-ai==2.2.0'\n")
+        print(f"  Skipping install. Run: uv pip install '{shown}'\n")
         return False
 
     print("  Installing honcho-ai...", flush=True)
     # Environment-aware install: sealed hosted venvs redirect to the durable
     # data-volume target instead of writing to /opt/hermes (NS-605).
-    from tools.lazy_deps import install_specs
-
-    result = install_specs(["honcho-ai==2.2.0"])
+    result = install_specs(specs)
     if result.ok:
         print("  Installed.\n")
         return True
@@ -529,7 +535,7 @@ def _ensure_sdk_installed() -> bool:
         return False
     else:
         print(f"  Install failed:\n{(result.stderr or '').strip()}")
-        print("  Run manually: uv pip install 'honcho-ai==2.2.0'\n")
+        print(f"  Run manually: uv pip install '{shown}'\n")
         return False
 
 

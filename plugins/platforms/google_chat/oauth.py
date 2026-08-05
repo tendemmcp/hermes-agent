@@ -161,7 +161,14 @@ SCOPES: List[str] = [
 ]
 
 # Pip packages required by the Google Chat adapter and its OAuth flow.
-_REQUIRED_PACKAGES = [
+#
+# Read from the ``[google-chat]`` extra in pyproject.toml rather than restated
+# here. Duplicating the pins meant a security floor (e.g. httplib2
+# GHSA-j5g9-f88f-gfj3) had to be bumped in two files in lockstep, and the copy
+# here silently drifting was invisible to `uv audit` / OSV, which read the
+# lockfile. The literal list is kept only as a fallback for installs where
+# pyproject isn't on disk.
+_FALLBACK_PACKAGES = [
     "google-cloud-pubsub==2.39.0",
     "google-api-python-client==2.194.0",
     "google-auth==2.55.1",
@@ -170,6 +177,19 @@ _REQUIRED_PACKAGES = [
     "httplib2==0.32.0",
     "pyasn1==0.6.4",
 ]
+
+
+def _required_packages() -> List[str]:
+    """Return the [google-chat] extra's specs, falling back to the literals."""
+    try:
+        from tools.lazy_deps import extra_specs
+
+        specs = list(extra_specs("google-chat"))
+        if specs:
+            return specs
+    except Exception:
+        pass
+    return list(_FALLBACK_PACKAGES)
 
 # Out-of-band redirect: Google deprecated the ``urn:ietf:wg:oauth:2.0:oob``
 # flow, so we use a localhost redirect that's expected to FAIL. The user
@@ -382,7 +402,7 @@ def _ensure_deps() -> None:
 def _missing_required_packages() -> List[str]:
     """Return exact requirements absent or stale in this interpreter."""
     missing = []
-    for spec in _REQUIRED_PACKAGES:
+    for spec in _required_packages():
         requirement = Requirement(spec)
         try:
             installed = _distribution_version(requirement.name)
