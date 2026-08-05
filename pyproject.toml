@@ -84,7 +84,13 @@ dependencies = [
   "urllib3>=2.7.0,<3",
   # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
   # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
-  "cryptography==48.0.1",  # CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf; ==48.0.1 (not 49.x): msal and alibabacloud-tea-openapi cap <49, hindsight-api-slim needs >=48.0.1
+  # 50.0.0 fixes CVE-2026-69247 (GHSA-g6cj-pr64-35w5 — PKCS#7 EnvelopedData
+  # Bleichenbacher oracle); 49.0.0 fixed GHSA-m2h6-j472-rp4c (wildcard DNS
+  # names escaping permittedSubtrees) and GHSA-jwv3-5hgf-82ww (exponential
+  # path-building on duplicate self-signed intermediates). See the
+  # cryptography override in [tool.uv]: alibabacloud-tea-openapi 0.4.5 still
+  # caps <49 and has no release that lifts it.
+  "cryptography==50.0.0",  # CVE-2026-69247, GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww, CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
   # out of the box.  ``tzdata`` ships the Olson database as a data package
@@ -367,9 +373,18 @@ override-dependencies = [
   # so, we force-override this to pynacl 1.6. here.
   # remove this when we update discord.py
   "pynacl>=1.6,<1.7",
+  # alibabacloud-tea-openapi 0.4.5 (latest, 2026-07-14) caps cryptography<49,
+  # which would strand us on 48.0.1 and its three open advisories (see the
+  # cryptography pin in [project].dependencies). It uses cryptography only for
+  # RSA/AES request signing, which did not change incompatibly in 49/50, so
+  # force the patched version. Remove this when alibabacloud-tea-openapi
+  # publishes a release that lifts the cap.
+  "cryptography>=50,<51",
 ]
 exclude-newer = "14 days"
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, aiohttp = false }
+# cryptography 50.0.0 (2026-07-31) is inside the 14-day quarantine window but
+# carries the CVE-2026-69247 fix, so it is exempted.
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, aiohttp = false, cryptography = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's

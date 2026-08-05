@@ -689,6 +689,54 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
+# Overrides forced onto every lazy install, mirroring
+# ``[tool.uv] override-dependencies`` in pyproject.toml.
+#
+# ``uv pip install`` / ``pip install`` do NOT read ``[tool.uv]``, so a
+# transitive dep that caps a security-pinned package below its patched floor
+# silently DOWNGRADES the core venv on first use of the backend that pulls it.
+# Measured with cryptography: the core venv ships 50.0.0, then enabling
+# DingTalk (``alibabacloud-dingtalk`` -> ``alibabacloud-tea-openapi==0.4.5``,
+# which caps ``cryptography<49``) resolved to::
+#
+#     + cryptography==48.0.1     # three open advisories, re-introduced
+#
+# Pinning the floor alongside the specs is NOT a fix: the resolver satisfies
+# it by walking ``alibabacloud-tea-openapi`` back to 0.3.16 (a two-year-old
+# sdist build) instead, and pinning both is simply unsatisfiable. An overrides
+# file is the only mechanism that forces the patched version while keeping the
+# backend at its intended version, so it is passed to the uv tier below.
+_SECURITY_OVERRIDES: tuple[str, ...] = (
+    # alibabacloud-tea-openapi 0.4.5 caps cryptography<49; 48.0.1 carries
+    # GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww and CVE-2026-69247. The cap is
+    # stale, not a real incompatibility — the package touches cryptography
+    # only for RSA/AES request signing. Keep in sync with the matching
+    # override in pyproject.toml's [tool.uv].
+    "cryptography>=50,<51",
+)
+
+
+def _security_overrides_file() -> Optional[Path]:
+    """Write ``_SECURITY_OVERRIDES`` to a temp requirements file for ``--overrides``.
+
+    Returns the path, or None if the file can't be written (in which case the
+    caller installs without overrides — same behaviour as before, just with
+    the downgrade risk this guards against).
+    """
+    if not _SECURITY_OVERRIDES:
+        return None
+    try:
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="hermes-lazy-overrides-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(_SECURITY_OVERRIDES) + "\n")
+        return Path(path)
+    except Exception as e:
+        logger.debug("Could not build security overrides file: %s", e)
+        return None
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -717,6 +765,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             return _InstallResult(False, "", err)
         constraints = _core_constraints_file()
 
+    overrides = _security_overrides_file()
+
     target_args: list[str] = []
     if target is not None:
         # --target tells both uv and pip to install into an arbitrary dir.
@@ -724,6 +774,19 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     constraint_args: list[str] = []
     if constraints is not None:
         constraint_args = ["--constraint", str(constraints)]
+    # uv-only: pip has no --overrides. See _SECURITY_OVERRIDES.
+    override_args: list[str] = []
+    # pip tier: --overrides doesn't exist, but --constraint enforces the same
+    # floor. Measured difference on the DingTalk case: with the constraint pip
+    # holds cryptography at 50.0.0 and resolves alibabacloud-tea-openapi back
+    # to 0.3.16; without it, cryptography is downgraded to 48.0.1 instead. An
+    # older backend is a functional regression, a downgraded cryptography is a
+    # security one — so the fallback tier takes the constraint. (uv's
+    # --overrides avoids the tradeoff entirely and is tried first.)
+    pip_override_args: list[str] = []
+    if overrides is not None:
+        override_args = ["--overrides", str(overrides)]
+        pip_override_args = ["--constraint", str(overrides)]
 
     try:
         venv_root = Path(sys.executable).parent.parent
@@ -747,7 +810,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         if uv_bin:
             try:
                 r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
+                    [uv_bin, "pip", "install", *target_args, *constraint_args, *override_args, *specs],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
@@ -785,7 +848,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
         try:
             r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *specs],
+                pip_cmd + ["install", *target_args, *constraint_args, *pip_override_args, *specs],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
@@ -798,11 +861,12 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         except Exception as e:
             return _InstallResult(False, "", f"pip install failed: {e}")
     finally:
-        if constraints is not None:
-            try:
-                constraints.unlink()
-            except OSError:
-                pass
+        for tmp in (constraints, overrides):
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
 
 # =============================================================================

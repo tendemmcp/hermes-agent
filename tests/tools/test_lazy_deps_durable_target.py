@@ -180,7 +180,8 @@ class TestInstallArgConstruction:
         assert cmd[-1] == "somepkg==1.2.3"
 
     def test_no_target_args_in_venv_scoped_mode(self, monkeypatch):
-        # Env unset → plain venv-scoped install, no --target / --constraint.
+        # Env unset → plain venv-scoped install, no --target and no
+        # core-constraints file.
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
         monkeypatch.setattr(ld.shutil, "which", lambda _: None)
         captured = {}
@@ -194,8 +195,20 @@ class TestInstallArgConstruction:
         monkeypatch.setattr(ld.subprocess, "run", fake_run)
         result = ld._venv_pip_install(("somepkg==1.2.3",))
         assert result.success
-        assert "--target" not in captured["cmd"]
-        assert "--constraint" not in captured["cmd"]
+        cmd = captured["cmd"]
+        assert "--target" not in cmd
+        # The durable-target mode's core-constraints file must be absent. The
+        # pip tier does still carry a --constraint holding the security floor
+        # (see tools/lazy_deps._SECURITY_OVERRIDES), so assert on the file's
+        # role rather than on the flag's mere presence.
+        constraint_paths = [
+            Path(cmd[i + 1])
+            for i, tok in enumerate(cmd)
+            if tok == "--constraint"
+        ]
+        assert not any(
+            p.name.startswith("hermes-core-constraints-") for p in constraint_paths
+        ), f"venv-scoped install must not pin against a core-constraints file: {cmd}"
 
 
 @pytest.mark.skipif(
